@@ -1,0 +1,203 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: Template to automatically setup Qualys AWS EC2 Connector for Asset Scanning
+Metadata:
+  Author: "Sean Nicholson"
+  Version: "1.0"
+  Updated: "12/27/2018"
+  Version Comments: "Adapted from Jason Carter's CF template from 5/31/2018"
+Parameters:
+  UserName:
+    Default: {supply_Qualys_user_name}
+    Description: User Authorized to Create a Qualys AWS Connector
+    Type: String
+  Password:
+    Default: {supply_Qualys_user_password}
+    Description: Password of the User Authorized to Create an Qualys AWS Connector
+    Type: String
+    NoEcho: true
+  BaseUrl:
+    Default: https://qualysapi.qg2.apps.qualys.com
+    Description: Base URL of the Qualys Server
+    Type: String
+  ExternalId:
+    Default: Empty
+    Description: (Optional) ExternalId to embed in role, one will be generated if empty
+    Type: String
+  RoleName:
+    Default: CF-QualysEC2ConnectorRole
+    Description: Name of the Role to Create
+    Type: String
+Resources:
+  ConnectorFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      Environment:
+        Variables:
+          BASEURL: !Ref BaseUrl
+          EXTERNALID: !Ref ExternalId
+          USERNAME: !Ref UserName
+          PASSWORD: !Ref Password
+          ROLENAME: !Ref RoleName
+      Code:
+        ZipFile: !Sub |
+          import json
+          import traceback
+          import os
+          from botocore.vendored import requests
+          import cfnresponse
+          import uuid
+
+          def lambda_handler(event,context):
+              EXTERNALID = os.getenv('EXTERNALID')
+              ROLENAME = os.getenv('ROLENAME')
+
+              dataConnectorId = 12345678
+              qualysAccountId = 12345
+
+              try:
+                api_endpoint="{}/qps/rest/2.0/create/am/awsassetdataconnector".format(os.getenv('BASEURL'))
+                ACCOUNT_ID = context.invoked_function_arn.split(":")[4]
+                EXTERNALID = uuid.uuid4().hex if EXTERNALID == "Empty" else EXTERNALID
+
+                print("API_ENDPOINT: {}".format(api_endpoint))
+                print("ACCOUNT_ID: {}".format(ACCOUNT_ID))
+                print("EXTERNALID: {}".format(EXTERNALID))
+
+                data= {
+                    "ServiceRequest":{
+                      "data":{
+                          "AwsAssetDataConnector":{
+                            "name":"CF_EC2_{}".format(ACCOUNT_ID),
+                            "description": "Connector for AWS Account {} - Implemented with CloudFormation".format(ACCOUNT_ID),
+                            "arn":"arn:aws:iam::{}:role/{}".format(ACCOUNT_ID, ROLENAME),
+                            "externalId":"{}".format(EXTERNALID),
+                            "allRegions":"true",
+                            "disabled":"false",
+                            "activation": {
+                              "set": {
+                                "ActivationModule": "VM"
+                              }
+                            }
+                          }
+                        }
+                      }
+                  }
+                auth=(os.getenv('USERNAME'), os.getenv('PASSWORD'))
+
+                print("DATA: {}".format(data))
+                print("AUTH: {}".format(auth))
+
+                headers = {"X-Requested-With": "Qualys CloudFormation (python)"}
+                headers['Accept'] = 'application/json'
+                headers['Content-Type'] = 'application/json'
+
+                r = requests.post(api_endpoint, json=data, auth=auth, headers=headers)
+                print("RESPONSE: {}".format(r))
+                data = r.json()
+                print("DATA: {}".format(data))
+
+
+                responseData = {}
+                if 'ServiceResponse' in data:
+
+                  if 'responseCode' in data['ServiceResponse']:
+                    responseData['responseCode'] = data['ServiceResponse']['responseCode']
+                  if 'responseErrorDetails' in data['ServiceResponse']:
+                      responseData['responseErrorDetails'] = data['ServiceResponse']['responseErrorDetails']['errorMessage']
+                      cfnresponse.send(event, context, cfnresponse.FAILED, responseData)
+
+                  if 'data' in data['ServiceResponse']:
+                    if 'AwsAssetDataConnector' in data['ServiceResponse']['data'][0]:
+                        record = data['ServiceResponse']['data'][0]['AwsAssetDataConnector']
+                        if 'id' in record:
+                            dataConnectorId = record['id']
+                        if 'qualysAwsAccountId' in record:
+                            qualysAccountId = record['qualysAwsAccountId']
+              except Exception as e:
+                traceback.print_exc()
+                responseData['responseErrorDetails'] = e
+                cfnresponse.send(event, context, cfnresponse.FAILED, responseData)
+
+              responseData['DataConnectorId'] = dataConnectorId
+              responseData['AccountId'] = qualysAccountId
+              responseData['ExternalId'] = EXTERNALID
+              cfnresponse.send(event, context, cfnresponse.SUCCESS, responseData)
+
+      Description: Lambda Function to Register Qualys AWS EC2 Connector and Create associated Role
+      Handler: index.lambda_handler
+      Role: !GetAtt 'LambdaExecutionRole.Arn'
+      Runtime: python3.6
+      Timeout: '30'
+  LambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - lambda.amazonaws.com
+            Action:
+              - sts:AssumeRole
+      Path: /
+      Policies:
+        - PolicyName: root
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: arn:aws:logs:*:*:*
+              - Effect: Allow
+                Action:
+                  - iam:CreateRole
+                Resource: '*'
+  QualysConnectorRole:
+    DependsOn: QualysEC2RoleCrossAccount
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Ref RoleName
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              AWS: !GetAtt 'CustomResource.AccountId'
+            Condition:
+              StringEquals:
+                sts:ExternalId: !GetAtt 'CustomResource.ExternalId'
+            Action:
+              - sts:AssumeRole
+      Path: /
+      ManagedPolicyArns:
+        - !Ref QualysEC2RoleCrossAccount
+
+  QualysEC2RoleCrossAccount:
+    Type: AWS::IAM::ManagedPolicy
+    Properties:
+      ManagedPolicyName: "QualysEC2RoleCrossAccount"
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+        - Action:
+            - ec2:DescribeInstances
+            - ec2:DescribeImages
+            - ec2:DescribeNetworkInterfaces
+          Resource: '*'
+          Effect: Allow
+
+  CustomResource:
+    Type: Custom::CustomResource
+    Properties:
+      ServiceToken: !GetAtt 'ConnectorFunction.Arn'
+Outputs:
+  ExternalId:
+    Description: ExternalId generated (or passed) required by the Qualys Role.
+    Value: !GetAtt 'CustomResource.ExternalId'
+  DataConnectorId:
+    Description: The Qualys Id of the configured Connector
+    Value: !GetAtt 'CustomResource.DataConnectorId'
